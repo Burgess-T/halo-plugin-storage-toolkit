@@ -14,7 +14,6 @@ import org.springframework.core.io.buffer.DataBuffer;
 import org.springframework.core.io.buffer.DataBufferUtils;
 import org.springframework.core.io.buffer.DefaultDataBufferFactory;
 import org.springframework.http.HttpHeaders;
-import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.codec.multipart.FilePart;
 import org.springframework.http.codec.multipart.FormFieldPart;
@@ -22,12 +21,10 @@ import org.springframework.http.codec.multipart.Part;
 import org.springframework.http.server.reactive.ServerHttpRequest;
 import org.springframework.http.server.reactive.ServerHttpRequestDecorator;
 import org.springframework.lang.NonNull;
-import org.springframework.security.core.Authentication;
-import org.springframework.security.core.context.ReactiveSecurityContextHolder;
-import org.springframework.security.web.server.context.ServerSecurityContextRepository;
 import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatcher;
 import org.springframework.security.web.server.util.matcher.ServerWebExchangeMatchers;
 import org.springframework.stereotype.Component;
+import org.springframework.util.LinkedMultiValueMap;
 import org.springframework.util.MultiValueMap;
 import org.springframework.web.server.ServerWebExchange;
 import org.springframework.web.server.ServerWebExchangeDecorator;
@@ -35,10 +32,9 @@ import org.springframework.web.server.WebFilterChain;
 import reactor.core.publisher.Flux;
 import reactor.core.publisher.Mono;
 import reactor.core.scheduler.Schedulers;
-import run.halo.app.core.extension.attachment.Attachment;
-import run.halo.app.core.extension.service.AttachmentService;
 import run.halo.app.security.AdditionalWebFilter;
 
+import java.nio.file.Path;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.Semaphore;
@@ -56,13 +52,8 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
     private final ImageProcessor imageProcessor;
     private final SettingsManager settingsManager;
     private final ProcessingLogService processingLogService;
-    private final AttachmentService attachmentService;
-    private final ServerSecurityContextRepository securityContextRepository;
 
     private final DefaultDataBufferFactory bufferFactory = new DefaultDataBufferFactory();
-    
-    private static final com.fasterxml.jackson.databind.ObjectMapper OBJECT_MAPPER = 
-        run.halo.app.infra.utils.JsonUtils.mapper();
 
     /**
      * 默认并发处理数
@@ -74,7 +65,7 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
      * 使用 volatile 确保多线程可见性
      */
     private volatile Semaphore processingPermits = new Semaphore(DEFAULT_PROCESSING_CONCURRENCY);
-    
+
     /**
      * 当前配置的并发数
      */
@@ -112,7 +103,7 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
         } else if (configuredConcurrency > 10) {
             configuredConcurrency = 10;
         }
-        
+
         if (configuredConcurrency != currentConcurrency) {
             synchronized (this) {
                 if (configuredConcurrency != currentConcurrency) {
@@ -148,7 +139,7 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
 
     /**
      * 处理编辑器上传请求（Console/UC）
-     * 直接调用 AttachmentService.upload() 完成上传，不传递给下游
+     * 通过 decorateExchange + chain.filter() 传递处理后的图片给下游控制器
      */
     private Mono<Void> processEditorRequest(ServerWebExchange exchange, WebFilterChain chain, ProcessingSource source) {
         return settingsManager.getConfig()
@@ -161,48 +152,32 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                     log.debug("Editor image processing disabled");
                     return chain.filter(exchange);
                 }
-                
+
                 // 获取对应的附件配置
                 Mono<AttachmentUploadConfig> configMono = ProcessingSource.CONSOLE_EDITOR == source
                     ? settingsManager.getConsoleAttachmentConfig()
                     : settingsManager.getUcAttachmentConfig();
-                
+
                 return configMono.flatMap(attachConfig -> {
                     if (!shouldProcessForConfig(config, attachConfig.policyName(), attachConfig.groupName())) {
                         log.debug("{}: policy/group not matched, skip processing", source);
                         return chain.filter(exchange);
                     }
-                    return doProcessEditorUpload(exchange, chain, config, attachConfig, source);
+                    return doProcessEditorUpload(exchange, chain, config, source);
                 });
             });
     }
 
     /**
      * 执行编辑器上传处理
-     * 处理图片后直接调用 AttachmentService 上传
+     * 处理图片后通过 decorateExchange + chain.filter() 传递给下游控制器
      */
     private Mono<Void> doProcessEditorUpload(ServerWebExchange exchange, WebFilterChain chain,
-                                              ProcessingConfig config, AttachmentUploadConfig attachConfig,
-                                              ProcessingSource source) {
+                                              ProcessingConfig config, ProcessingSource source) {
         if (!isMultipartRequest(exchange.getRequest())) {
             return chain.filter(exchange);
         }
 
-        // 使用 ServerSecurityContextRepository 从 session/cookie 中加载认证信息
-        return securityContextRepository.load(exchange)
-            .map(ctx -> ctx.getAuthentication())
-            .filter(auth -> auth != null && auth.isAuthenticated())
-            .switchIfEmpty(chain.filter(exchange).then(Mono.empty()))
-            .flatMap(auth -> doProcessEditorUploadWithAuth(exchange, chain, config, attachConfig, source, auth)
-                .then(Mono.empty()));
-    }
-
-    /**
-     * 带认证信息的编辑器上传处理
-     */
-    private Mono<Void> doProcessEditorUploadWithAuth(ServerWebExchange exchange, WebFilterChain chain,
-                                                      ProcessingConfig config, AttachmentUploadConfig attachConfig,
-                                                      ProcessingSource source, org.springframework.security.core.Authentication auth) {
         return exchange.getMultipartData()
             .flatMap(parts -> {
                 FilePart filePart = (FilePart) parts.getFirst("file");
@@ -291,7 +266,7 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                                 .flatMap(result -> {
                                     saveProcessingLog(result, filename, originalSize, startTime, source);
 
-                                    // 只有 SUCCESS 和 PARTIAL 才直接上传
+                                    // SUCCESS 或 PARTIAL：用处理后的数据替换原始数据，传递给下游控制器
                                     if (result.status() == ProcessingStatus.SUCCESS ||
                                         result.status() == ProcessingStatus.PARTIAL) {
                                         log.debug("Image processed: {} -> {} ({} bytes -> {} bytes, {}% reduction)",
@@ -299,8 +274,10 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                                             originalSize, result.data().length,
                                             originalSize > 0 ? (100 - (result.data().length * 100 / originalSize)) : 0);
 
-                                        return uploadAndRespond(attachConfig, result.filename(),
-                                            result.data(), MediaType.parseMediaType(result.contentType()), auth, exchange);
+                                        DataBuffer buffer = bufferFactory.wrap(result.data());
+                                        return decorateExchange(exchange, parts, filePart, Flux.just(buffer),
+                                                result.filename(), MediaType.parseMediaType(result.contentType()))
+                                            .flatMap(chain::filter);
                                     }
 
                                     // SKIPPED 或 FAILED，传递下游
@@ -319,71 +296,6 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                         .doFinally(signal -> acquiredPermits.release()) // 释放获取许可时的同一个 Semaphore
                     );
             });
-    }
-
-    /**
-     * 调用 AttachmentService 上传文件并返回 JSON 响应
-     */
-    private Mono<Void> uploadAndRespond(AttachmentUploadConfig attachConfig, String filename, 
-                                         byte[] data, MediaType mediaType,
-                                         org.springframework.security.core.Authentication auth,
-                                         ServerWebExchange exchange) {
-        log.debug("Uploading file: {} to policy: {}, group: {}, user: {}", 
-            filename, attachConfig.policyName(), attachConfig.groupName(), auth.getName());
-        
-        Flux<DataBuffer> content = Flux.just(bufferFactory.wrap(data));
-        
-        return attachmentService.upload(
-                attachConfig.policyName(),
-                attachConfig.groupName(),
-                filename,
-                content,
-                mediaType
-            )
-            .doOnNext(a -> log.debug("Upload success: {}", a.getMetadata().getName()))
-            .flatMap(attachment -> attachmentService.getPermalink(attachment)
-                .doOnNext(permalink -> {
-                    if (attachment.getStatus() == null) {
-                        attachment.setStatus(new Attachment.AttachmentStatus());
-                    }
-                    attachment.getStatus().setPermalink(permalink.toString());
-                })
-                .thenReturn(attachment)
-            )
-            .contextWrite(ReactiveSecurityContextHolder.withAuthentication(auth))
-            .flatMap(attachment -> writeJsonResponse(exchange, attachment))
-            .onErrorResume(e -> {
-                log.error("Failed to upload attachment: {}", e.getMessage(), e);
-                return writeErrorResponse(exchange, e.getMessage());
-            });
-    }
-
-    /**
-     * 写入 JSON 响应
-     */
-    private Mono<Void> writeJsonResponse(ServerWebExchange exchange, Attachment attachment) {
-        exchange.getResponse().setStatusCode(HttpStatus.OK);
-        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
-        return exchange.getResponse().writeWith(
-            Mono.fromCallable(() -> {
-                byte[] jsonBytes = OBJECT_MAPPER.writeValueAsBytes(attachment);
-                return bufferFactory.wrap(jsonBytes);
-            })
-        ).onErrorResume(e -> {
-            log.error("Failed to serialize attachment: {}", e.getMessage());
-            return writeErrorResponse(exchange, "Failed to serialize response");
-        });
-    }
-
-    /**
-     * 写入错误响应
-     */
-    private Mono<Void> writeErrorResponse(ServerWebExchange exchange, String message) {
-        exchange.getResponse().setStatusCode(HttpStatus.INTERNAL_SERVER_ERROR);
-        exchange.getResponse().getHeaders().setContentType(MediaType.APPLICATION_JSON);
-        String errorJson = "{\"error\":\"" + message.replace("\"", "\\\"") + "\"}";
-        DataBuffer buffer = bufferFactory.wrap(errorJson.getBytes());
-        return exchange.getResponse().writeWith(Mono.just(buffer));
     }
 
     /**
@@ -429,10 +341,10 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                         .flatMap(buffers -> decorateExchange(exchange, parts, filePart, Flux.fromIterable(buffers)))
                         .flatMap(chain::filter);
                 }
-                
+
                 // 检查是否是允许处理的格式
                 if (!imageProcessor.isAllowedFormat(fileContentType, config)) {
-                    log.debug("Format not in allowed list, skip processing: {} ({})", 
+                    log.debug("Format not in allowed list, skip processing: {} ({})",
                         filePart.filename(), fileContentType);
                     return filePart.content().collectList()
                         .flatMap(buffers -> decorateExchange(exchange, parts, filePart, Flux.fromIterable(buffers)))
@@ -453,7 +365,7 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
 
     /**
      * 执行附件管理上传的图片处理
-     * 只有处理成功（SUCCESS/PARTIAL）才直接上传，其他情况传递下游
+     * 处理成功（SUCCESS/PARTIAL）时通过 decorateExchange 替换原始数据传递给下游控制器
      */
     private Mono<Void> doProcessAttachmentManager(ServerWebExchange exchange, WebFilterChain chain,
                                                    MultiValueMap<String, Part> parts, FilePart filePart,
@@ -461,9 +373,6 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
         String filename = filePart.filename();
         String contentType = getContentType(filePart);
         Instant startTime = Instant.now();
-
-        // 提取附件配置（policyName, groupName）
-        AttachmentUploadConfig attachConfig = extractAttachmentConfig(parts);
 
         // 提前检查 Content-Length，大文件直接跳过处理
         long contentLength = filePart.headers().getContentLength();
@@ -520,17 +429,19 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                         .flatMap(result -> {
                             saveProcessingLog(result, filename, originalSize, startTime, source);
 
-                            // 只有 SUCCESS 和 PARTIAL 才直接上传
+                            // SUCCESS 或 PARTIAL：用处理后的数据替换原始数据，传递给下游控制器
                             if (result.status() == ProcessingStatus.SUCCESS ||
                                 result.status() == ProcessingStatus.PARTIAL) {
-                                log.debug("图片处理完成，直接上传，绕过下游 Filter: {} -> {}", filename, result.filename());
                                 log.debug("Image processed: {} -> {} ({} bytes -> {} bytes, {}% reduction)",
                                     filename, result.filename(),
                                     originalSize, result.data().length,
                                     originalSize > 0 ? (100 - (result.data().length * 100 / originalSize)) : 0);
 
                                 MediaType newContentType = MediaType.parseMediaType(result.contentType());
-                                return uploadWithAuth(exchange, attachConfig, result.filename(), result.data(), newContentType);
+                                DataBuffer buffer = bufferFactory.wrap(result.data());
+                                return decorateExchange(exchange, parts, filePart, Flux.just(buffer),
+                                        result.filename(), newContentType)
+                                    .flatMap(chain::filter);
                             }
 
                             // SKIPPED 或 FAILED，传递下游
@@ -559,7 +470,7 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                 return false;
             }
         }
-        
+
         List<String> targetGroups = config.getTargetGroups();
         if (targetGroups != null && !targetGroups.isEmpty()) {
             String currentGroup = groupName != null ? groupName : "";
@@ -568,24 +479,24 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                 return false;
             }
         }
-        
+
         return true;
     }
 
     private boolean shouldProcessForPolicyAndGroup(MultiValueMap<String, Part> parts, ProcessingConfig config) {
         String currentPolicy = "";
         String currentGroup = "";
-        
+
         FormFieldPart policyPart = (FormFieldPart) parts.getFirst("policyName");
         if (policyPart != null) {
             currentPolicy = policyPart.value();
         }
-        
+
         Part groupPart = parts.getFirst("groupName");
         if (groupPart instanceof FormFieldPart formField) {
             currentGroup = formField.value();
         }
-        
+
         return shouldProcessForConfig(config, currentPolicy, currentGroup);
     }
 
@@ -619,23 +530,37 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
                                                              List<DataBuffer> buffers,
                                                              String filename,
                                                              MediaType contentType) {
-        String multipartContent = buildMultipartContent(boundary, parts, filename, contentType);
-        String footer = "\r\n--" + boundary + "--\r\n";
-
-        final DataBuffer headerBuffer = bufferFactory.wrap(multipartContent.getBytes());
-        final DataBuffer footerBuffer = bufferFactory.wrap(footer.getBytes());
+        final byte[] headerBytes = buildMultipartContent(boundary, parts, filename, contentType).getBytes();
+        final byte[] footerBytes = ("\r\n--" + boundary + "--\r\n").getBytes();
 
         final List<DataBuffer> finalBuffers = buffers.isEmpty()
             ? List.of(bufferFactory.wrap(new byte[0]))
             : buffers;
 
+        // 合并 buffers 为 byte[]，构建 ProcessedFilePart 用于覆写 getMultipartData()
+        final byte[] combinedBytes = combineBuffers(finalBuffers);
+        ProcessedFilePart processedFilePart = new ProcessedFilePart(
+            filename, contentType, combinedBytes, bufferFactory);
+        MultiValueMap<String, Part> newParts = new LinkedMultiValueMap<>();
+        for (var entry : parts.entrySet()) {
+            if (!"file".equals(entry.getKey())) {
+                newParts.put(entry.getKey(), entry.getValue());
+            }
+        }
+        newParts.add("file", processedFilePart);
+
+        // 计算重建后的 body 总大小，用于修正 Content-Length
+        final long newContentLength = headerBytes.length + combinedBytes.length + footerBytes.length;
+
         final ServerHttpRequest decoratedRequest = new ServerHttpRequestDecorator(exchange.getRequest()) {
             @Override
             @NonNull
             public Flux<DataBuffer> getBody() {
-                return Flux.just(headerBuffer)
-                    .concatWith(Flux.fromIterable(finalBuffers))
-                    .concatWith(Flux.just(footerBuffer));
+                return Flux.just(
+                    bufferFactory.wrap(headerBytes),
+                    bufferFactory.wrap(combinedBytes),
+                    bufferFactory.wrap(footerBytes)
+                );
             }
 
             @Override
@@ -643,6 +568,8 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
             public HttpHeaders getHeaders() {
                 HttpHeaders headers = new HttpHeaders();
                 headers.putAll(exchange.getRequest().getHeaders());
+                // 修正 Content-Length，使其与重建后的 body 大小一致
+                headers.setContentLength(newContentLength);
                 return headers;
             }
         };
@@ -652,6 +579,12 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
             @NonNull
             public ServerHttpRequest getRequest() {
                 return decoratedRequest;
+            }
+
+            @Override
+            @NonNull
+            public Mono<MultiValueMap<String, Part>> getMultipartData() {
+                return Mono.just(newParts);
             }
         });
     }
@@ -665,11 +598,11 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
         for (var entry : parts.entrySet()) {
             String partName = entry.getKey();
             List<Part> partList = entry.getValue();
-            
+
             if ("file".equals(partName)) {
                 continue;
             }
-            
+
             for (Part part : partList) {
                 if (part instanceof FormFieldPart formField) {
                     content.append("--").append(boundary).append("\r\n");
@@ -708,36 +641,6 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
         return contentType != null ? contentType.toString() : null;
     }
 
-    /**
-     * 从 multipart parts 提取附件上传配置
-     */
-    private AttachmentUploadConfig extractAttachmentConfig(MultiValueMap<String, Part> parts) {
-        String policyName = "";
-        String groupName = "";
-        FormFieldPart policyPart = (FormFieldPart) parts.getFirst("policyName");
-        if (policyPart != null) {
-            policyName = policyPart.value();
-        }
-        Part groupPart = parts.getFirst("groupName");
-        if (groupPart instanceof FormFieldPart formField) {
-            groupName = formField.value();
-        }
-        return new AttachmentUploadConfig(policyName, groupName);
-    }
-
-    /**
-     * 获取认证信息并上传文件（用于附件管理上传）
-     * 直接上传，不传递给下游 Filter，避免与其他插件冲突
-     */
-    private Mono<Void> uploadWithAuth(ServerWebExchange exchange, AttachmentUploadConfig attachConfig,
-                                       String filename, byte[] data, MediaType mediaType) {
-        return securityContextRepository.load(exchange)
-            .map(ctx -> ctx.getAuthentication())
-            .filter(auth -> auth != null && auth.isAuthenticated())
-            .flatMap(auth -> uploadAndRespond(attachConfig, filename, data, mediaType, auth, exchange))
-            .switchIfEmpty(writeErrorResponse(exchange, "Authentication required"));
-    }
-
     private void saveProcessingLog(ProcessingResult result, String originalFilename,
                                     long originalSize, Instant startTime, ProcessingSource source) {
         processingLogService.saveResultLog(result, originalFilename, originalSize, startTime, source)
@@ -759,5 +662,61 @@ public class ImageProcessingWebFilter implements AdditionalWebFilter {
     @Override
     public int getOrder() {
         return -1000;  // 确保最先执行，避免与其他插件冲突
+    }
+
+    /**
+     * 合并多个 DataBuffer 为 byte[]
+     */
+    private byte[] combineBuffers(List<DataBuffer> buffers) {
+        int total = buffers.stream().mapToInt(DataBuffer::readableByteCount).sum();
+        byte[] result = new byte[total];
+        int offset = 0;
+        for (DataBuffer buf : buffers) {
+            int len = buf.readableByteCount();
+            buf.read(result, offset, len);
+            offset += len;
+        }
+        return result;
+    }
+
+    /**
+     * 包装处理后图片数据的 FilePart 实现
+     * 用于覆写 getMultipartData() 返回的 Part，使编辑器端点能读取处理后的数据
+     */
+    private static class ProcessedFilePart implements FilePart {
+        private final String filename;
+        private final HttpHeaders headers;
+        private final byte[] data;
+        private final DefaultDataBufferFactory bufferFactory;
+
+        ProcessedFilePart(String filename, MediaType contentType, byte[] data,
+                          DefaultDataBufferFactory bufferFactory) {
+            this.filename = filename;
+            this.data = data;
+            this.bufferFactory = bufferFactory;
+            this.headers = new HttpHeaders();
+            this.headers.setContentType(contentType);
+            this.headers.setContentDispositionFormData("file", filename);
+            this.headers.setContentLength(data.length);
+        }
+
+        @Override
+        public String name() { return "file"; }
+
+        @Override
+        public String filename() { return filename; }
+
+        @Override
+        public HttpHeaders headers() { return headers; }
+
+        @Override
+        public Flux<DataBuffer> content() {
+            return Flux.just(bufferFactory.wrap(data));
+        }
+
+        @Override
+        public Mono<Void> transferTo(Path dest) {
+            return DataBufferUtils.write(content(), dest);
+        }
     }
 }
