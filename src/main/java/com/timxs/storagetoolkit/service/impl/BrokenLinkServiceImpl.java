@@ -3,6 +3,7 @@ package com.timxs.storagetoolkit.service.impl;
 import com.timxs.storagetoolkit.extension.BrokenLink;
 import com.timxs.storagetoolkit.extension.BrokenLinkScanStatus;
 import com.timxs.storagetoolkit.extension.BrokenLinkScanStatus.BrokenLinkScanStatusStatus;
+import com.timxs.storagetoolkit.extension.ReferenceScanStatus;
 import com.timxs.storagetoolkit.model.BrokenLinkReplaceResult;
 import com.timxs.storagetoolkit.model.BrokenLinkVo;
 import com.timxs.storagetoolkit.model.BrokenLinkVo.BrokenLinkSource;
@@ -45,55 +46,20 @@ public class BrokenLinkServiceImpl implements BrokenLinkService {
 
     @Override
     public Mono<BrokenLinkScanStatus> startScan() {
-        // 断链扫描现在由引用统计扫描同步完成
-        // 先更新状态为扫描中，然后调用引用扫描（异步执行）
-        return getStatus()
-            .flatMap(status -> {
-                // 检查是否正在扫描
-                if (status.getStatus() != null
-                    && BrokenLinkScanStatus.Phase.SCANNING.equals(status.getStatus().getPhase())) {
+        // 断链扫描由引用扫描同步完成，扫描状态统一由 ReferenceScanStatus 管理
+        return referenceService.getScanStatus()
+            .flatMap(refStatus -> {
+                // 检查引用扫描是否正在进行（统一的扫描状态）
+                if (refStatus.getStatus() != null
+                    && ReferenceScanStatus.Phase.SCANNING.equals(refStatus.getStatus().getPhase())) {
                     return Mono.error(new IllegalStateException("扫描正在进行中"));
                 }
 
-                // 更新状态为扫描中
-                if (status.getStatus() == null) {
-                    status.setStatus(new BrokenLinkScanStatusStatus());
-                }
-                status.getStatus().setPhase(BrokenLinkScanStatus.Phase.SCANNING);
-                status.getStatus().setStartTime(Instant.now());
-                status.getStatus().setErrorMessage(null);
-
-                return client.update(status)
-                    .flatMap(updated -> {
-                        // 异步执行扫描
-                        referenceService.startScan()
-                            .subscribe(
-                                result -> log.info("断链扫描完成"),
-                                error -> {
-                                    log.error("断链扫描失败", error);
-                                    // 更新状态为错误
-                                    updateScanError(error.getMessage()).subscribe(
-                                        v -> {},
-                                        err -> log.error("更新断链扫描错误状态失败", err)
-                                    );
-                                }
-                            );
-                        return Mono.just(updated);
-                    });
+                // 等待 referenceService 设置完 SCANNING 状态后再返回
+                // referenceService.startScan() 在设置 SCANNING 后立即返回，实际扫描异步执行
+                return referenceService.startScan()
+                    .then(getStatus());
             });
-    }
-
-    private Mono<Void> updateScanError(String errorMessage) {
-        return getStatus()
-            .flatMap(status -> {
-                if (status.getStatus() == null) {
-                    status.setStatus(new BrokenLinkScanStatusStatus());
-                }
-                status.getStatus().setPhase(BrokenLinkScanStatus.Phase.ERROR);
-                status.getStatus().setErrorMessage(errorMessage);
-                return client.update(status);
-            })
-            .then();
     }
 
     @Override
@@ -106,14 +72,6 @@ public class BrokenLinkServiceImpl implements BrokenLinkService {
                 status.setStatus(new BrokenLinkScanStatusStatus());
                 return client.create(status);
             }));
-    }
-
-    private Mono<ListResult<BrokenLinkVo>> listBrokenLinks(int page, int size) {
-        return listBrokenLinks(page, size, null, null, null, null);
-    }
-
-    private Mono<ListResult<BrokenLinkVo>> listBrokenLinks(int page, int size, String sourceType, String keyword) {
-        return listBrokenLinks(page, size, sourceType, keyword, null, null);
     }
 
     @Override

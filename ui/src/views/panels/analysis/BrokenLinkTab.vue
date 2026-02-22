@@ -74,7 +74,7 @@
     <!-- 断链列表 -->
     <div class="card">
       <div v-if="loading" class="loading-state">加载中...</div>
-      <div v-else-if="!stats.lastScanTime && stats.phase !== 'SCANNING'" class="empty-state">
+      <div v-else-if="!stats.lastScanTime && !scanning" class="empty-state">
         <span class="empty-icon">🔗</span>
         <span class="empty-text">尚未进行扫描</span>
         <span class="empty-hint">点击「扫描断链」开始检测</span>

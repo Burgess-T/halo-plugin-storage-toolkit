@@ -19,7 +19,6 @@
           删除选中 ({{ selectedAttachments.length }})
         </button>
         <span class="scan-info" v-if="stats.lastScanTime">上次扫描：{{ formatTime(stats.lastScanTime) }}</span>
-        <span class="scan-info" v-else-if="stats.phase === 'SCANNING'">正在扫描...</span>
         <span class="scan-info error" v-else-if="stats.phase === 'ERROR'">扫描失败：{{ stats.errorMessage }}</span>
       </div>
       <div class="toolbar-right">

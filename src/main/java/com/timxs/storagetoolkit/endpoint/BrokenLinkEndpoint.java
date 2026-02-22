@@ -3,6 +3,7 @@ package com.timxs.storagetoolkit.endpoint;
 import com.timxs.storagetoolkit.model.BrokenLinkReplaceResult;
 import com.timxs.storagetoolkit.model.BrokenLinkVo;
 import com.timxs.storagetoolkit.service.BrokenLinkService;
+import com.timxs.storagetoolkit.service.ReferenceService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
@@ -24,6 +25,7 @@ import java.util.List;
 public class BrokenLinkEndpoint {
 
     private final BrokenLinkService brokenLinkService;
+    private final ReferenceService referenceService;
 
     /**
      * 开始断链扫描
@@ -31,7 +33,8 @@ public class BrokenLinkEndpoint {
     @PostMapping("/scan")
     public Mono<StatusResponse> startScan() {
         return brokenLinkService.startScan()
-            .map(this::toStatusResponse)
+            .flatMap(blStatus -> referenceService.getScanStatus()
+                .map(refStatus -> toStatusResponse(blStatus, refStatus)))
             .onErrorResume(IllegalStateException.class, e ->
                 Mono.error(new ResponseStatusException(HttpStatus.CONFLICT, e.getMessage()))
             );
@@ -42,8 +45,10 @@ public class BrokenLinkEndpoint {
      */
     @GetMapping("/status")
     public Mono<StatusResponse> getStatus() {
-        return brokenLinkService.getStatus()
-            .map(this::toStatusResponse);
+        return Mono.zip(
+            brokenLinkService.getStatus(),
+            referenceService.getScanStatus()
+        ).map(tuple -> toStatusResponse(tuple.getT1(), tuple.getT2()));
     }
 
     /**
@@ -99,10 +104,14 @@ public class BrokenLinkEndpoint {
             ));
     }
 
-    private StatusResponse toStatusResponse(com.timxs.storagetoolkit.extension.BrokenLinkScanStatus status) {
-        var s = status.getStatus();
+    private StatusResponse toStatusResponse(
+            com.timxs.storagetoolkit.extension.BrokenLinkScanStatus brokenLinkStatus,
+            com.timxs.storagetoolkit.extension.ReferenceScanStatus refStatus) {
+        var s = brokenLinkStatus.getStatus();
+        var refS = refStatus.getStatus();
         return new StatusResponse(
-            s != null ? s.getPhase() : null,
+            // 扫描阶段统一由 ReferenceScanStatus 管理
+            refS != null ? refS.getPhase() : null,
             s != null ? s.getStartTime() : null,
             s != null ? s.getLastScanTime() : null,
             s != null ? s.getScannedContentCount() : 0,
