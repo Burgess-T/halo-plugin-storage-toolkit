@@ -2,9 +2,9 @@
 
 [![GitHub Release](https://img.shields.io/github/v/release/Tim0x0/halo-plugin-storage-toolkit?style=flat-square&logo=github)](https://github.com/Tim0x0/halo-plugin-storage-toolkit/releases)
 [![GitHub License](https://img.shields.io/github/license/Tim0x0/halo-plugin-storage-toolkit?style=flat-square)](https://github.com/Tim0x0/halo-plugin-storage-toolkit/blob/main/LICENSE)
-[![Halo Version](https://img.shields.io/badge/Halo-%3E%3D2.22.0-blue?style=flat-square)](https://www.halo.run)
+[![Halo Version](https://img.shields.io/badge/Halo-%3E%3D2.22.1-blue?style=flat-square)](https://www.halo.run)
 
-Halo 存储增强插件，支持图片格式转换、水印添加等功能，帮助优化网站图片加载性能。
+Halo 存储增强插件，支持图片处理（压缩、水印、格式转换）、批量处理、附件库分析（断链检测、引用扫描、重复文件检测）和 URL 引用替换等功能。
 
 ![处理日志示例](docs/doc_sample2.png)
 
@@ -35,24 +35,29 @@ Halo 存储增强插件，支持图片格式转换、水印添加等功能，帮
 - 流式处理大图片，降低内存占用
 - 支持处理超大尺寸图片
 
-### ⚡ 批量处理 (New)
+### ⚡ 批量处理
 - **功能全面**：支持对已上传的图片进行批量**压缩**、**添加水印**和**格式转换**
 - **灵活策略**：支持选择**是否保留原文件**（保留原图则生成新附件，不保留则覆盖原附件）
 - **进度监控**：实时显示处理进度、成功/失败数量、跳过数量
 - **结果统计**：详细展示处理结果、节省空间统计和失败原因
 
-### 📈 存储分析与优化 (New)
+### 📈 存储分析与优化
 - **存储统计**：按类型、策略、分组统计附件数量和大小，提供可视化图表
 - **重复文件检测**：基于文件 MD5 哈希识别重复文件，显示可节省空间
 - **死链检测**：扫描文章、页面、评论、瞬间、图库等内容，发现引用的失效附件链接
 - **死链白名单**：支持配置忽略特定的 URL 模式（支持精确匹配和前缀匹配）
 - **未引用检测**：识别未被任何内容使用的"孤儿"附件，支持一键清理
-- **清理日志**：记录所有删除操作详情（删除原因、文件大小、操作者、删除时间等）
 
-### 📊 处理日志
-- 记录每次图片处理的详细信息
-- 统计成功/失败/跳过数量
-- 显示节省的存储空间
+### 🔗 URL 引用替换
+- **自动替换**：批量处理覆盖原文件后，自动替换内容中的旧附件链接
+- **重复合并**：删除重复附件时，自动将引用转移到保留的附件
+- **断链修复**：支持从断链检测结果中手动替换失效 URL
+- **覆盖范围**：文章、页面、评论、回复、用户资料、主题/插件配置等
+
+### 📊 日志系统
+- **处理日志**：记录每次图片处理的详细信息，统计成功/失败/跳过数量，显示节省的存储空间
+- **清理日志**：记录所有删除操作详情（删除原因、文件大小、操作者、删除时间等）
+- **替换日志**：记录 URL 引用替换操作的详情（来源、替换前后 URL、成功/失败状态）
 - 支持按文件名、状态、时间、来源筛选
 - 自动清理过期日志
 
@@ -133,7 +138,7 @@ pnpm dev
 ## 技术栈
 
 - **后端**：Java 21、Spring WebFlux、Halo Plugin API
-- **前端**：Vue 3、TypeScript、Halo Console Components
+- **前端**：Vue 3、TypeScript、Halo Console Components、ECharts
 - **图片处理**：Java ImageIO、WebP ImageIO、AVIF ImageIO
 
 ## 许可证
