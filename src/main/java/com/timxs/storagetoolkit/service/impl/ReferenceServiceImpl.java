@@ -89,6 +89,9 @@ public class ReferenceServiceImpl implements ReferenceService {
     // DocTree GVK (doc.halo.run/v1alpha1/DocTree)
     private static final GroupVersionKind DOC_TREE_GVK =
         new GroupVersionKind("doc.halo.run", "v1alpha1", "DocTree");
+    // Docsme 文档版本 GVK (doc.halo.run/v1alpha1/ProjectVersion)
+    private static final GroupVersionKind PROJECT_VERSION_GVK =
+        new GroupVersionKind("doc.halo.run", "v1alpha1", "ProjectVersion");
 
     // 内存中的扫描标志（用于检测服务重启）
     private final AtomicInteger scanningFlag = new AtomicInteger(0);
@@ -260,7 +263,9 @@ public class ReferenceServiceImpl implements ReferenceService {
             .flatMap(post -> {
                 String postName = post.getMetadata().getName();
                 String postTitle = post.getSpec().getTitle();
-                String postUrl = "/archives/" + post.getSpec().getSlug();
+                // 优先从 status.permalink 获取，为空时 fallback 到 slug 拼接
+                String postPermalink = post.getStatus() != null ? post.getStatus().getPermalink() : null;
+                String postUrl = StringUtils.hasText(postPermalink) ? postPermalink : "/archives/" + post.getSpec().getSlug();
                 // 检查是否在回收站
                 boolean isDeleted = post.getSpec().getDeleted() != null && post.getSpec().getDeleted();
                 // 检查是否为草稿（headSnapshot != releaseSnapshot）
@@ -312,7 +317,9 @@ public class ReferenceServiceImpl implements ReferenceService {
             .flatMap(page -> {
                 String pageName = page.getMetadata().getName();
                 String pageTitle = page.getSpec().getTitle();
-                String pageUrl = "/" + page.getSpec().getSlug();
+                // 优先从 status.permalink 获取，为空时 fallback 到 slug 拼接
+                String pagePermalink = page.getStatusOrDefault().getPermalink();
+                String pageUrl = StringUtils.hasText(pagePermalink) ? pagePermalink : "/" + page.getSpec().getSlug();
                 // 检查是否在回收站
                 boolean isDeleted = page.getSpec().getDeleted() != null && page.getSpec().getDeleted();
                 // 检查是否为草稿（headSnapshot != releaseSnapshot）
@@ -616,7 +623,11 @@ public class ReferenceServiceImpl implements ReferenceService {
     private Mono<Void> scanMoments(ReferenceScanContext context) {
         return scanExtensions(context, MOMENT_GVK, "瞬间", (ext, rootNode) -> {
             String momentName = ext.getMetadata().getName();
-            String sourceUrl = "/moments/" + momentName;
+            // 优先从 status.permalink 获取，为空时 fallback 到硬编码路径
+            JsonNode statusNode = rootNode.get("status");
+            String permalink = statusNode != null && statusNode.has("permalink")
+                ? statusNode.get("permalink").asText(null) : null;
+            String sourceUrl = StringUtils.hasText(permalink) ? permalink : "/moments/" + momentName;
             JsonNode specNode = rootNode.get("spec");
 
             if (specNode != null) {
@@ -658,11 +669,16 @@ public class ReferenceServiceImpl implements ReferenceService {
             JsonNode specNode = rootNode.get("spec");
 
             if (specNode != null) {
+                // 获取分组信息，拼接精确的图库 URL
+                String groupName = specNode.has("groupName") ? specNode.get("groupName").asText(null) : null;
+                String sourceUrl = StringUtils.hasText(groupName)
+                    ? "/photos?group=" + groupName : "/photos";
+
                 // 1. 提取 url 字段（内容）
                 String url = specNode.has("url") ? specNode.get("url").asText(null) : null;
                 if (StringUtils.hasText(url)) {
                     AttachmentReference.ReferenceSource urlSource = createSource(
-                        "Photo", name, "图库", "/photos", false, "content");
+                        "Photo", name, "图库", sourceUrl, false, "content");
                     context.addUrl(url, urlSource);
                 }
 
@@ -670,7 +686,7 @@ public class ReferenceServiceImpl implements ReferenceService {
                 String cover = specNode.has("cover") ? specNode.get("cover").asText(null) : null;
                 if (StringUtils.hasText(cover) && !cover.equals(url)) {
                     AttachmentReference.ReferenceSource coverSource = createSource(
-                        "Photo", name, "图库", "/photos", false, "cover");
+                        "Photo", name, "图库", sourceUrl, false, "cover");
                     context.addUrl(cover, coverSource);
                 }
             }
@@ -690,77 +706,151 @@ public class ReferenceServiceImpl implements ReferenceService {
             return Mono.empty();
         }
 
-        // 1. 扫描 Doc 内容
-        Mono<Void> scanDocContent = scanExtensions(context, DOC_GVK, "文档内容", (ext, rootNode) -> {
-            String docName = ext.getMetadata().getName();
-            JsonNode specNode = rootNode.get("spec");
+        // 预获取 Doc 所属版本的发布状态，用于确定引用类型
+        return fetchDocVersionPublishStates()
+            .defaultIfEmpty(Map.of())
+            .flatMap(docPublishStates -> {
+                // 1. 扫描 Doc 内容
+                Mono<Void> scanDocContent = scanExtensions(context, DOC_GVK, "文档内容", (ext, rootNode) -> {
+                    String docName = ext.getMetadata().getName();
+                    JsonNode specNode = rootNode.get("spec");
 
-            String headSnapshotName = specNode != null && specNode.has("headSnapshot")
-                ? specNode.get("headSnapshot").asText() : null;
-            String releaseSnapshotName = specNode != null && specNode.has("releaseSnapshot")
-                ? specNode.get("releaseSnapshot").asText() : null;
+                    String headSnapshotName = specNode != null && specNode.has("headSnapshot")
+                        ? specNode.get("headSnapshot").asText() : null;
+                    String releaseSnapshotName = specNode != null && specNode.has("releaseSnapshot")
+                        ? specNode.get("releaseSnapshot").asText() : null;
 
-            // 检查是否为草稿
-            boolean isDraft = !StringUtils.hasText(releaseSnapshotName)
-                || !releaseSnapshotName.equals(headSnapshotName);
-            // 内容类型：草稿用 draft，已发布用 content
-            String contentType = isDraft ? "draft" : "content";
+                    // 确定引用类型：版本未发布 -> unpublished，版本已发布 -> draft/content
+                    String contentType;
+                    Boolean isInPublishedVersion = docPublishStates.get(docName);
+                    if (isInPublishedVersion != null && !isInPublishedVersion) {
+                        contentType = "unpublished";
+                    } else {
+                        boolean isDraft = !StringUtils.hasText(releaseSnapshotName)
+                            || !releaseSnapshotName.equals(headSnapshotName);
+                        contentType = isDraft ? "draft" : "content";
+                    }
 
-            // 用于 patch 计算的 base
-            String baseSnapshotName = StringUtils.hasText(releaseSnapshotName)
-                ? releaseSnapshotName : headSnapshotName;
+                    // 用于 patch 计算的 base
+                    String baseSnapshotName = StringUtils.hasText(releaseSnapshotName)
+                        ? releaseSnapshotName : headSnapshotName;
 
-            if (StringUtils.hasText(headSnapshotName) && StringUtils.hasText(baseSnapshotName)) {
-                AttachmentReference.ReferenceSource source = createSource(
-                    "Doc", docName, "Doc:" + docName, null, false, contentType);
+                    if (StringUtils.hasText(headSnapshotName) && StringUtils.hasText(baseSnapshotName)) {
+                        AttachmentReference.ReferenceSource source = createSource(
+                            "Doc", docName, "Doc:" + docName, null, false, contentType);
 
-                final String finalBaseSnapshotName = baseSnapshotName;
-                return client.fetch(Snapshot.class, baseSnapshotName)
-                    .flatMap(baseSnapshot -> {
-                        if (headSnapshotName.equals(finalBaseSnapshotName)) {
-                            return Mono.just(ContentWrapper.patchSnapshot(baseSnapshot, baseSnapshot));
+                        final String finalBaseSnapshotName = baseSnapshotName;
+                        return client.fetch(Snapshot.class, baseSnapshotName)
+                            .flatMap(baseSnapshot -> {
+                                if (headSnapshotName.equals(finalBaseSnapshotName)) {
+                                    return Mono.just(ContentWrapper.patchSnapshot(baseSnapshot, baseSnapshot));
+                                }
+                                return client.fetch(Snapshot.class, headSnapshotName)
+                                    .map(headSnapshot -> ContentWrapper.patchSnapshot(headSnapshot, baseSnapshot));
+                            })
+                            .doOnNext(contentWrapper -> {
+                                String htmlContent = contentWrapper.getContent();
+                                if (StringUtils.hasText(htmlContent)) {
+                                    ContentScanner.ExtractResult result = contentScanner.extractUrlsFromHtml(htmlContent);
+                                    context.addExtractResult(result, source);
+                                }
+                            })
+                            .onErrorResume(e -> {
+                                log.warn("获取文档 {} 内容失败: {}", docName, e.getMessage());
+                                return Mono.empty();
+                            })
+                            .then();
+                    }
+                    return Mono.empty();
+                });
+
+                // 2. 扫描 Project 图标
+                Mono<Void> scanProjectIcon = scanExtensions(context, PROJECT_GVK, "文档项目图标", (ext, rootNode) -> {
+                    JsonNode specNode = rootNode.get("spec");
+                    JsonNode statusNode = rootNode.get("status");
+
+                    String projectName = ext.getMetadata().getName();
+                    String displayName = specNode != null && specNode.has("displayName")
+                        ? specNode.get("displayName").asText() : projectName;
+                    String icon = specNode != null && specNode.has("icon")
+                        ? specNode.get("icon").asText() : null;
+                    String permalink = statusNode != null && statusNode.has("permalink")
+                        ? statusNode.get("permalink").asText() : null;
+
+                    if (StringUtils.hasText(icon)) {
+                        AttachmentReference.ReferenceSource source = createSource(
+                            "Doc", projectName, displayName, permalink, false, "icon");
+                        context.addUrl(icon, source);
+                    }
+                    return Mono.empty();
+                });
+
+                return scanDocContent.then(scanProjectIcon);
+            });
+    }
+
+    /**
+     * 预获取 Doc 所属版本的发布状态
+     * 通过 DocTree 关联 Doc 和 ProjectVersion（DocTree.spec.docName -> Doc, DocTree.spec.projectVersionName -> ProjectVersion）
+     * 如果一个 Doc 被多个版本引用，任一版本已发布则视为已发布
+     * @return Map: docName -> isInPublishedVersion
+     */
+    private Mono<Map<String, Boolean>> fetchDocVersionPublishStates() {
+        var docTreeSchemeOpt = schemeManager.fetch(DOC_TREE_GVK);
+        var versionSchemeOpt = schemeManager.fetch(PROJECT_VERSION_GVK);
+        if (docTreeSchemeOpt.isEmpty() || versionSchemeOpt.isEmpty()) {
+            return Mono.just(Map.of());
+        }
+
+        return Mono.zip(
+                // ProjectVersion 列表
+                client.listAll(versionSchemeOpt.get().type(), ListOptions.builder().build(), Sort.unsorted())
+                    .collectList(),
+                // DocTree 列表
+                client.listAll(docTreeSchemeOpt.get().type(), ListOptions.builder().build(), Sort.unsorted())
+                    .collectList()
+            )
+            .map(tuple -> {
+                // 构建 versionName -> published
+                Map<String, Boolean> versionPublished = new HashMap<>();
+                for (var ext : tuple.getT1()) {
+                    try {
+                        JsonNode root = objectMapper.readTree(objectMapper.writeValueAsString(ext));
+                        JsonNode specNode = root.get("spec");
+                        boolean published = specNode != null && specNode.has("publish")
+                            && specNode.get("publish").asBoolean(false);
+                        versionPublished.put(ext.getMetadata().getName(), published);
+                    } catch (Exception e) {
+                        log.debug("解析 ProjectVersion 失败: {}", e.getMessage());
+                    }
+                }
+
+                // 通过 DocTree 关联，构建 docName -> isInPublishedVersion
+                Map<String, Boolean> docPublished = new HashMap<>();
+                for (var ext : tuple.getT2()) {
+                    try {
+                        JsonNode root = objectMapper.readTree(objectMapper.writeValueAsString(ext));
+                        JsonNode specNode = root.get("spec");
+                        String docName = specNode != null && specNode.has("docName")
+                            ? specNode.get("docName").asText(null) : null;
+                        String versionName = specNode != null && specNode.has("projectVersionName")
+                            ? specNode.get("projectVersionName").asText(null) : null;
+
+                        if (docName != null && versionName != null) {
+                            boolean published = versionPublished.getOrDefault(versionName, true);
+                            // 任一关联版本已发布，则视为已发布
+                            docPublished.merge(docName, published, (a, b) -> a || b);
                         }
-                        return client.fetch(Snapshot.class, headSnapshotName)
-                            .map(headSnapshot -> ContentWrapper.patchSnapshot(headSnapshot, baseSnapshot));
-                    })
-                    .doOnNext(contentWrapper -> {
-                        String htmlContent = contentWrapper.getContent();
-                        if (StringUtils.hasText(htmlContent)) {
-                            ContentScanner.ExtractResult result = contentScanner.extractUrlsFromHtml(htmlContent);
-                            context.addExtractResult(result, source);
-                        }
-                    })
-                    .onErrorResume(e -> {
-                        log.warn("获取文档 {} 内容失败: {}", docName, e.getMessage());
-                        return Mono.empty();
-                    })
-                    .then();
-            }
-            return Mono.empty();
-        });
-
-        // 2. 扫描 Project 图标
-        Mono<Void> scanProjectIcon = scanExtensions(context, PROJECT_GVK, "文档项目图标", (ext, rootNode) -> {
-            JsonNode specNode = rootNode.get("spec");
-            JsonNode statusNode = rootNode.get("status");
-
-            String projectName = ext.getMetadata().getName();
-            String displayName = specNode != null && specNode.has("displayName")
-                ? specNode.get("displayName").asText() : projectName;
-            String icon = specNode != null && specNode.has("icon")
-                ? specNode.get("icon").asText() : null;
-            String permalink = statusNode != null && statusNode.has("permalink")
-                ? statusNode.get("permalink").asText() : null;
-
-            if (StringUtils.hasText(icon)) {
-                AttachmentReference.ReferenceSource source = createSource(
-                    "Doc", projectName, displayName, permalink, false, "icon");
-                context.addUrl(icon, source);
-            }
-            return Mono.empty();
-        });
-
-        return scanDocContent.then(scanProjectIcon);
+                    } catch (Exception e) {
+                        log.debug("解析 DocTree 失败: {}", e.getMessage());
+                    }
+                }
+                return docPublished;
+            })
+            .onErrorResume(e -> {
+                log.debug("获取文档版本发布状态失败: {}", e.getMessage());
+                return Mono.just(Map.of());
+            });
     }
 
     /**

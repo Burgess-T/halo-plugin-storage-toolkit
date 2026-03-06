@@ -86,6 +86,7 @@ const REFERENCE_TYPE_LABELS: Record<string, string> = {
   'cover': '封面',
   'content': '内容',
   'draft': '草稿',
+  'unpublished': '未发布',
   'media': '媒体',
   'comment': '评论',
   'reply': '回复',
